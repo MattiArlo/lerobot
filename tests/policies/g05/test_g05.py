@@ -1315,6 +1315,17 @@ def test_forward_backward_update_and_save_reload(tmp_path: Path):
     torch.testing.assert_close(actual, expected)
 
 
+def test_model_card_uses_the_g05_licence(monkeypatch):
+    from lerobot.common import train_utils
+
+    monkeypatch.setattr(train_utils.ModelCard, "validate", lambda self: None)
+    card = train_utils.generate_model_card(_config())
+
+    assert card.data.license == "other"
+    assert "G0.5 Community License Agreement" in card.text
+    assert "not endorsed by Galaxea" in card.text
+
+
 def test_gated_delta_cached_suffix_matches_tokenwise_decode():
     config = Qwen3_5TextConfig(
         vocab_size=32,

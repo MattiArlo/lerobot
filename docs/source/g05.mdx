@@ -27,9 +27,9 @@ Python package, Hydra, or OmegaConf.
 > [!WARNING]
 > G0.5 code and checkpoints use the
 > [G0.5 Community License](https://huggingface.co/OpenGalaxea/G05/blob/main/licenses/LICENSE-G0.5),
-> including non-commercial restrictions. LeRobot does not redistribute checkpoint
-> weights, download gated files, or imply that Apache-2.0 applies to those materials.
-> Accept the license yourself and use a private or local checkpoint.
+> including non-commercial restrictions; Apache-2.0 does not apply to those materials.
+> The converted checkpoints ship that license as `LICENSE` together with its `NOTICE`,
+> and are not endorsed by Galaxea.
 
 ## Checkpoints
 
@@ -278,3 +278,7 @@ The native LeRobot integration is distributed with LeRobot, while G0.5 code
 and checkpoint weights remain subject to the
 [G0.5 Community License](https://huggingface.co/OpenGalaxea/G05/blob/main/licenses/LICENSE-G0.5).
 Review and accept that license before downloading or using a checkpoint.
+
+A fine-tune is a derivative work of G0.5. When you redistribute it, include the
+`LICENSE` and `NOTICE` files of the checkpoint it was derived from: LeRobot does
+not copy them for you, but the generated model card states the license.
