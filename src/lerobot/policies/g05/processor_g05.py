@@ -539,91 +539,6 @@ class G05RelativeJointActionsStep(RelativeActionsProcessorStep):
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="g05_tail_normalization")
-class G05TailNormalizationStep(ProcessorStep):
-    """Apply or invert the author's q01/q99 log-tail compression."""
-
-    inverse: bool = False
-    tail_scale: float = 0.075
-    stats: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
-    _tensor_stats: dict[str, dict[str, torch.Tensor]] = field(default_factory=dict, init=False, repr=False)
-
-    _TAIL_STATS = ("tail_q01", "tail_q99", "tail_mean", "tail_mask")
-
-    def __post_init__(self) -> None:
-        """Materialize the configured tail statistics as tensors."""
-        self._tensor_stats = {
-            key: {
-                name: torch.as_tensor(value)
-                for name, value in feature_stats.items()
-                if name in self._TAIL_STATS
-            }
-            for key, feature_stats in self.stats.items()
-        }
-
-    def _transform(self, value: torch.Tensor, key: str) -> torch.Tensor:
-        """Compress values beyond the q01/q99 tails logarithmically, or invert that."""
-        if key not in self._tensor_stats:
-            return value
-        stats = {name: tensor.to(value.device) for name, tensor in self._tensor_stats[key].items()}
-        if set(stats) != set(self._TAIL_STATS):
-            raise ValueError(f"Incomplete G0.5 tail statistics for {key}.")
-        q01 = stats["tail_q01"].to(value.dtype)
-        q99 = stats["tail_q99"].to(value.dtype)
-        mean = stats["tail_mean"].to(value.dtype)
-        mask = stats["tail_mask"].bool()
-        degenerate = (q99 <= q01) | (mean <= q01) | (mean >= q99)
-        mask = mask & ~degenerate
-        c_pos = torch.where(mask, self.tail_scale * (q99 - mean), torch.ones_like(q99))
-        c_neg = torch.where(mask, self.tail_scale * (mean - q01), torch.ones_like(q01))
-        if self.inverse:
-            positive = q99 + c_pos * torch.expm1(torch.clamp((value - q99) / c_pos, min=0.0))
-            negative = q01 - c_neg * torch.expm1(torch.clamp((q01 - value) / c_neg, min=0.0))
-        else:
-            positive = q99 + c_pos * torch.log1p(torch.clamp((value - q99) / c_pos, min=0.0))
-            negative = q01 - c_neg * torch.log1p(torch.clamp((q01 - value) / c_neg, min=0.0))
-        transformed = torch.where(value > q99, positive, torch.where(value < q01, negative, value))
-        return torch.where(mask, transformed, value)
-
-    def __call__(self, transition: EnvTransition) -> EnvTransition:
-        """Apply the tail transform to `observation.state` and to the action."""
-        transition = transition.copy()
-        observation = dict(transition.get(TransitionKey.OBSERVATION) or {})
-        if OBS_STATE in observation:
-            observation[OBS_STATE] = self._transform(observation[OBS_STATE], OBS_STATE)
-        transition[TransitionKey.OBSERVATION] = observation
-        action = transition.get(TransitionKey.ACTION)
-        if isinstance(action, torch.Tensor):
-            transition[TransitionKey.ACTION] = self._transform(action, ACTION)
-        return transition
-
-    def state_dict(self) -> dict[str, torch.Tensor]:
-        """Flatten the per-feature tail statistics for serialization."""
-        return {
-            f"{key}.{name}": tensor.cpu()
-            for key, feature_stats in self._tensor_stats.items()
-            for name, tensor in feature_stats.items()
-        }
-
-    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
-        """Restore the per-feature tail statistics from their flattened form."""
-        self._tensor_stats = {}
-        for flat_key, tensor in state.items():
-            key, name = flat_key.rsplit(".", 1)
-            self._tensor_stats.setdefault(key, {})[name] = tensor
-
-    def transform_features(
-        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
-    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        """Pass the feature contract through unchanged."""
-        return features
-
-    def get_config(self) -> dict[str, Any]:
-        """Return this step's serializable configuration."""
-        return {"inverse": self.inverse, "tail_scale": self.tail_scale}
-
-
-@dataclass
 @ProcessorStepRegistry.register(name="g05_normalization_clamp")
 class G05NormalizationClampStep(ProcessorStep):
     """Match the author's finite clamp after normalization."""
@@ -824,15 +739,6 @@ def _tokenizer_policy_config(config: G05Config) -> dict[str, Any]:
     }
 
 
-def _normalization_mode(config: G05Config) -> NormalizationMode:
-    """Map the checkpoint's `normalization_mode` string onto a lerobot `NormalizationMode`."""
-    if config.normalization_mode == "q01_q99":
-        return NormalizationMode.QUANTILES
-    if config.normalization_mode in {"z_score", "z_score_tail_mixed"}:
-        return NormalizationMode.MEAN_STD
-    return NormalizationMode.IDENTITY
-
-
 def _project_stats(
     config: G05Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None,
@@ -883,25 +789,16 @@ def fix_g05_train_overrides(
     """Adapt ``lerobot-train``'s generic normalizer overrides to G0.5's pipeline.
 
     ``lerobot-train`` assumes a ``normalizer_processor``/``unnormalizer_processor`` step pair
-    that normalizes raw dataset-space stats with ``policy.config.normalization_mapping``. G0.5's
-    normalizer instead runs after ``G05EmbodimentProjectionStep`` (policy-space, padded dims) and
-    keeps its own mode in ``config.normalization_mode``; its unnormalizer is also renamed to
-    ``g05_stepwise_unnormalizer`` when per-timestep stats are enabled. Left alone, the override
-    either targets a step name that doesn't exist (unnormalizer) or silently replaces the correct
-    projected stats/norm_map with raw, all-identity ones (normalizer).
+    that normalizes raw dataset-space stats. G0.5's normalizer instead runs after
+    ``G05EmbodimentProjectionStep`` (policy-space, padded dims), and its unnormalizer is renamed
+    to ``g05_stepwise_unnormalizer`` when per-timestep stats are enabled. Left alone, the override
+    either targets a step name that doesn't exist (unnormalizer) or replaces the projected stats
+    with raw ones (normalizer).
     """
-    mode = _normalization_mode(config)
-    full_norm_map = {
-        FeatureType.STATE: mode,
-        FeatureType.ACTION: mode,
-        FeatureType.VISUAL: NormalizationMode.IDENTITY,
-    }
-
     preprocessor_overrides = dict(preprocessor_overrides or {})
     normalizer_override = preprocessor_overrides.get("normalizer_processor")
     if normalizer_override is not None:
         normalizer_override = dict(normalizer_override)
-        normalizer_override["norm_map"] = full_norm_map
         if normalizer_override.get("stats") is not None:
             normalizer_override["stats"] = _project_stats(config, normalizer_override["stats"])
         preprocessor_overrides["normalizer_processor"] = normalizer_override
@@ -910,7 +807,6 @@ def fix_g05_train_overrides(
     unnormalizer_override = postprocessor_overrides.pop("unnormalizer_processor", None)
     if unnormalizer_override is not None:
         unnormalizer_override = dict(unnormalizer_override)
-        unnormalizer_override["norm_map"] = {FeatureType.ACTION: mode}
         if unnormalizer_override.get("stats") is not None:
             unnormalizer_override["stats"] = _project_stats(config, unnormalizer_override["stats"])
         registry_name = (
@@ -1011,25 +907,16 @@ def make_g05_pre_post_processors(
 ]:
     """Build serializable G0.5 pipelines from checkpoint-authoritative metadata."""
 
-    if config.normalization_mode == "checkpoint" and not config.processor_metadata:
-        raise ValueError(
-            "normalization_mode='checkpoint' requires processor_metadata from the packaged checkpoint."
-        )
-    mode = _normalization_mode(config)
-    if mode is NormalizationMode.QUANTILES and dataset_stats:
-        for key in (OBS_STATE, ACTION):
-            if key in dataset_stats and not {"q01", "q99"} <= set(dataset_stats[key]):
+    if dataset_stats:
+        for key, feature_type in ((OBS_STATE, "STATE"), (ACTION, "ACTION")):
+            quantiles = config.normalization_mapping.get(feature_type) == NormalizationMode.QUANTILES
+            if quantiles and key in dataset_stats and not {"q01", "q99"} <= set(dataset_stats[key]):
                 raise ValueError(f"{key} requires real q01/q99 statistics; min/max must not be substituted.")
     policy_features = dict(config.input_features or {})
     policy_features.update(config.output_features or {})
     policy_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(config.policy_state_dim,))
     policy_features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(config.policy_action_dim,))
     projected_stats = _project_stats(config, dataset_stats)
-    norm_map = {
-        FeatureType.STATE: mode,
-        FeatureType.ACTION: mode,
-        FeatureType.VISUAL: NormalizationMode.IDENTITY,
-    }
 
     relative_step = G05RelativeJointActionsStep(
         enabled=config.use_relative_actions,
@@ -1060,7 +947,11 @@ def make_g05_pre_post_processors(
         )
     )
     action_filter = config.processor_metadata.get("action_filter") or {}
-    if str(action_filter.get("_target_", "")).endswith("R1LiteJointActionFilter"):
+    # The filter describes R1Lite's action parts; another embodiment fine-tuned from
+    # the same checkpoint keeps the metadata but not the layout it applies to.
+    if config.embodiment == "galaxea_r1lite" and str(action_filter.get("_target_", "")).endswith(
+        "R1LiteJointActionFilter"
+    ):
         action_parts = tuple(
             (str(item["key"]), int(item["shape"]))
             for item in (config.processor_metadata.get("shape_meta") or {}).get("action", [])
@@ -1087,12 +978,10 @@ def make_g05_pre_post_processors(
             ),
         ]
     )
-    if config.normalization_mode == "z_score_tail_mixed":
-        steps.append(G05TailNormalizationStep(stats=projected_stats or {}))
     steps.append(
         NormalizerProcessorStep(
             features=policy_features,
-            norm_map=norm_map,
+            norm_map=config.normalization_mapping,
             stats=projected_stats,
         )
     )
@@ -1123,7 +1012,7 @@ def make_g05_pre_post_processors(
     )
     unnormalizer_kwargs = {
         "features": {ACTION: policy_features[ACTION]},
-        "norm_map": {FeatureType.ACTION: mode},
+        "norm_map": config.normalization_mapping,
         "stats": projected_stats,
     }
     if config.use_stepwise_action_norm:
@@ -1133,8 +1022,6 @@ def make_g05_pre_post_processors(
             **unnormalizer_kwargs,
         )
     ]
-    if config.normalization_mode == "z_score_tail_mixed":
-        output_steps.append(G05TailNormalizationStep(inverse=True, stats=projected_stats or {}))
     output_steps.append(
         G05InverseActionProjectionStep(
             embodiment=config.embodiment, policy_action_dim=config.policy_action_dim

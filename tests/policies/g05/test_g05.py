@@ -37,7 +37,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5VisionRotaryEmbedding,
 )
 
-from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
 from lerobot.policies.g05.configuration_g05 import G05_CAMERA_PROFILES, G05_EMBODIMENT_MAPPINGS, G05Config
 from lerobot.policies.g05.modeling_g05 import (
@@ -47,7 +47,11 @@ from lerobot.policies.g05.modeling_g05 import (
     G05Policy,
     G05TextGeneration,
 )
-from lerobot.policies.g05.processor_g05 import G05RelativeJointActionsStep, G05TokenizerStep
+from lerobot.policies.g05.processor_g05 import (
+    G05ActionOperationMaskStep,
+    G05RelativeJointActionsStep,
+    G05TokenizerStep,
+)
 from lerobot.policies.g05.tokenizer_g05 import (
     G05_INPUT_IDS,
     G05_LABELS,
@@ -215,6 +219,18 @@ def _vision_backend(*, temporal_freq: int = 0):
     return backend
 
 
+_QUANTILES = {
+    "VISUAL": NormalizationMode.IDENTITY,
+    "STATE": NormalizationMode.QUANTILES,
+    "ACTION": NormalizationMode.QUANTILES,
+}
+_MEAN_STD = {
+    "VISUAL": NormalizationMode.IDENTITY,
+    "STATE": NormalizationMode.MEAN_STD,
+    "ACTION": NormalizationMode.MEAN_STD,
+}
+
+
 def _features():
     return {
         OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
@@ -224,10 +240,8 @@ def _features():
 
 
 def _config(**kwargs):
-    normalization_mode = kwargs.pop("normalization_mode", "identity")
     return G05Config(
         checkpoint_profile="custom",
-        normalization_mode=normalization_mode,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
         chunk_size=4,
@@ -428,7 +442,6 @@ def test_so101_runtime_pads_optional_left_wrist():
         raw_state_dim=6,
         chunk_size=32,
         n_action_steps=16,
-        normalization_mode="identity",
         camera_order=(
             "observation.images.exterior",
             "observation.images.wrist_left",
@@ -475,7 +488,6 @@ def test_libero_runtime_executes_ten_step_window_and_binarizes_gripper():
         return_continuous_action=True,
         chunk_size=32,
         n_action_steps=10,
-        normalization_mode="identity",
         libero_gripper_binarize=True,
     )
     _, postprocessor = make_pre_post_processors(config)
@@ -574,7 +586,7 @@ def test_lerobot_libero_two_finger_state_matches_author_first_qpos_contract():
 
 
 def test_quantile_mode_refuses_minmax_substitution():
-    config = _config(normalization_mode="q01_q99")
+    config = _config(normalization_mapping=_QUANTILES)
     stats = {
         OBS_STATE: {"min": torch.zeros(7), "max": torch.ones(7)},
         ACTION: {"min": torch.zeros(7), "max": torch.ones(7)},
@@ -584,7 +596,7 @@ def test_quantile_mode_refuses_minmax_substitution():
 
 
 def test_checkpoint_normalization_clips_to_author_finite_range():
-    config = _config(normalization_mode="q01_q99", normalization_clip=(-5.0, 5.0))
+    config = _config(normalization_mapping=_QUANTILES, normalization_clip=(-5.0, 5.0))
     stats = {
         OBS_STATE: {"q01": torch.zeros(7), "q99": torch.ones(7)},
         ACTION: {"q01": torch.zeros(4, 7), "q99": torch.ones(4, 7)},
@@ -608,7 +620,7 @@ def test_checkpoint_normalization_clips_to_author_finite_range():
 
 def test_stepwise_quantiles_constant_dimension_are_finite_and_serializable(tmp_path: Path):
     config = _config(
-        normalization_mode="q01_q99",
+        normalization_mapping=_QUANTILES,
         use_stepwise_action_norm=True,
         n_action_steps=2,
     )
@@ -677,7 +689,7 @@ def test_finetune_overrides_reproject_stats_and_retarget_stepwise_unnormalizer(t
         raw_action_dim=6,
         chunk_size=4,
         n_action_steps=4,
-        normalization_mode="q01_q99",
+        normalization_mapping=_QUANTILES,
         use_stepwise_action_norm=True,
         camera_order=cameras,
         camera_sizes=dict.fromkeys(cameras, (8, 8)),
@@ -1581,13 +1593,69 @@ def test_gated_checkpoint_loads_strictly():
 
 
 def test_project_stats_passes_dataset_count_through():
-    config = _config(normalization_mode="q01_q99")
+    config = _config(normalization_mapping=_QUANTILES)
     stats = {
         OBS_STATE: {"q01": torch.zeros(7), "q99": torch.ones(7), "count": torch.tensor([100])},
         ACTION: {"q01": torch.zeros(7), "q99": torch.ones(7), "count": torch.tensor([100])},
     }
 
     make_pre_post_processors(config, dataset_stats=stats)
+
+
+def _base_like_config(embodiment: str, width: int, **kwargs) -> G05Config:
+    """A `g05_base`-shaped config (27-dim layout, z-score) on another embodiment."""
+    raw_dim = len(G05_EMBODIMENT_MAPPINGS[embodiment]["state"])
+    return G05Config(
+        checkpoint_profile="custom",
+        embodiment=embodiment,
+        raw_state_dim=raw_dim,
+        raw_action_dim=raw_dim,
+        policy_state_dim=width,
+        policy_action_dim=width,
+        camera_order=G05_CAMERA_PROFILES[embodiment],
+        normalization_mapping=_MEAN_STD,
+        device="cpu",
+        **kwargs,
+    )
+
+
+def _raw_stats(dim: int) -> dict[str, dict[str, torch.Tensor]]:
+    feature_stats = {
+        "mean": torch.zeros(dim),
+        "std": torch.ones(dim),
+        "q01": -torch.ones(dim),
+        "q99": torch.ones(dim),
+        "count": torch.tensor([100]),
+    }
+    return {OBS_STATE: dict(feature_stats), ACTION: dict(feature_stats)}
+
+
+def test_input_features_follow_the_embodiment_not_the_saved_checkpoint():
+    config = _base_like_config(
+        "so100",
+        27,
+        input_features={
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(14,)),
+            "observation.images.head_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 256, 256)),
+        },
+    )
+
+    config.validate_features()
+
+    assert config.input_features[OBS_STATE].shape == (6,)
+    assert list(config.input_features) == [OBS_STATE, *G05_CAMERA_PROFILES["so100"]]
+
+
+def test_r1lite_action_filter_is_skipped_for_other_embodiments():
+    config = _base_like_config(
+        "so100",
+        27,
+        processor_metadata={"action_filter": {"_target_": "g05.filters.R1LiteJointActionFilter"}},
+    )
+
+    preprocessor, _ = make_pre_post_processors(config, dataset_stats=_raw_stats(6))
+
+    assert not any(isinstance(step, G05ActionOperationMaskStep) for step in preprocessor.steps)
 
 
 def test_named_embodiment_rebuilds_stale_camera_sizes():

@@ -35,12 +35,12 @@ Python package, Hydra, or OmegaConf.
 
 ### Input and Output Contracts
 
-| Profile          | Released action path                       | Raw → policy layout                          | Cameras                               | Predicted | Executed | Normalization                   |
-| ---------------- | ------------------------------------------ | -------------------------------------------- | ------------------------------------- | --------: | -------: | ------------------------------- |
-| `g05-base`       | Explicitly selected AR ActionCodec or flow | R1 Lite/Pro joints → 27D whole-body layout   | head + both wrists, 6-step history    |        32 |       16 | z-score-tail + q01/q99 grippers |
-| `g05-libero`     | Continuous flow                            | right EEF 6 + gripper 1 → 20D grouped layout | exterior, right wrist                 |        32 |       10 | stepwise q01/q99                |
-| `g05-robotwin20` | Continuous flow                            | two arms 6+gripper → 20D grouped layout      | high, left wrist, right wrist         |        32 |        8 | stepwise q01/q99                |
-| `g05-so101`      | Flow or AR ActionCodec + native CoT        | right arm joints 6 → 20D grouped layout      | exterior, optional left + right wrist |        32 |       16 | stepwise q01/q99                |
+| Profile          | Released action path                       | Raw → policy layout                          | Cameras                               | Predicted | Executed | Normalization    |
+| ---------------- | ------------------------------------------ | -------------------------------------------- | ------------------------------------- | --------: | -------: | ---------------- |
+| `g05-base`       | Explicitly selected AR ActionCodec or flow | R1 Lite/Pro joints → 27D whole-body layout   | head + both wrists, 6-step history    |        32 |       16 | stepwise z-score |
+| `g05-libero`     | Continuous flow                            | right EEF 6 + gripper 1 → 20D grouped layout | exterior, right wrist                 |        32 |       10 | stepwise q01/q99 |
+| `g05-robotwin20` | Continuous flow                            | two arms 6+gripper → 20D grouped layout      | high, left wrist, right wrist         |        32 |        8 | stepwise q01/q99 |
+| `g05-so101`      | Flow or AR ActionCodec + native CoT        | right arm joints 6 → 20D grouped layout      | exterior, optional left + right wrist |        32 |       16 | stepwise q01/q99 |
 
 Each packaged checkpoint stores the resolved model and processor configuration,
 ActionCodec metadata, statistics, exact prompt template, and license. Loading
@@ -207,6 +207,39 @@ Generate the required `subtask` and grounded `vqa` language columns with
 `--policy.recipe_path=/path/to/recipe.yaml` when training an embodiment with a
 different grounded camera; that selected recipe is serialized into the saved
 policy config.
+
+### Fine-tuning the base checkpoint on another arm
+
+`lerobot/g05_base` can be fine-tuned on a single-arm dataset by selecting the
+`so100` embodiment, which places six joints in the right-arm slots of the base
+layout. The example below uses an OMX dataset recorded with `top` and `wrist`
+cameras; the wrist camera goes to the right-wrist slot, and the unused left wrist
+is zero-filled. List-valued flags take quoted JSON.
+
+```bash
+lerobot-train \
+  --dataset.repo_id=${HF_USER}/omx_multicubes_annotated \
+  --policy.path=lerobot/g05_base \
+  --policy.embodiment=so100 \
+  --policy.raw_state_dim=6 \
+  --policy.raw_action_dim=6 \
+  --policy.camera_order='["observation.images.exterior","observation.images.wrist_left","observation.images.wrist_right"]' \
+  --policy.optional_camera_keys='["observation.images.wrist_left"]' \
+  --rename_map='{"observation.images.top": "observation.images.exterior", "observation.images.wrist": "observation.images.wrist_right"}' \
+  --policy.use_language_recipe=true \
+  --policy.device=cuda \
+  --policy.repo_id=${HF_USER}/g05_omx_finetuned \
+  --output_dir=outputs/train/g05_omx \
+  --job_name=g05_omx \
+  --batch_size=16 \
+  --steps=10000
+```
+
+Normalization uses the dataset's own statistics. The gripper stays absolute
+(`relative_exclude_joints=["gripper"]` in the base checkpoint), while arm joints
+are trained as deltas. Grounded `vqa` rows keep the camera key they were
+annotated with, so BBox targets need a recipe whose `bbox` binding names the
+dataset's camera (here `observation.images.top`) through `--policy.recipe_path`.
 
 The SO-101 recipe uses AdamW at `8e-5` with 1,000 warmup steps. The packaged
 LIBERO and RoboTwin configurations use their released `1e-5` recipe, with

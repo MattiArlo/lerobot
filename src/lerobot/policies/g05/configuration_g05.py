@@ -188,12 +188,7 @@ G05_POLICY_PARTS: dict[int, dict[str, int]] = {
     },
 }
 
-_PROFILE_DEFAULTS = {
-    "g05-base": ("z_score_tail_mixed", 27, 32),
-    "g05-libero": ("q01_q99", 20, 32),
-    "g05-robotwin20": ("q01_q99", 20, 32),
-    "g05-so101": ("q01_q99", 20, 32),
-}
+_CHECKPOINT_PROFILES = ("g05-base", "g05-libero", "g05-robotwin20", "g05-so101")
 
 
 @PreTrainedConfig.register_subclass("g05")
@@ -225,7 +220,6 @@ class G05Config(PreTrainedConfig):
     raw_state_dim: int = 7
     chunk_size: int = 16
     n_action_steps: int = 16
-    normalization_mode: str = "checkpoint"
     normalization_clip: tuple[float, float] | None = None
     use_relative_actions: bool = False
     relative_exclude_joints: tuple[str, ...] = ()
@@ -312,10 +306,10 @@ class G05Config(PreTrainedConfig):
                 predict_cot=self.predict_cot,
                 flow_only=samples_builder_target.endswith("FMOnly"),
             )
-        if self.checkpoint_profile not in _PROFILE_DEFAULTS and self.checkpoint_profile != "custom":
+        if self.checkpoint_profile not in _CHECKPOINT_PROFILES and self.checkpoint_profile != "custom":
             raise ValueError(
                 f"Unknown G0.5 checkpoint_profile={self.checkpoint_profile!r}; "
-                f"expected one of {sorted(_PROFILE_DEFAULTS)} or 'custom'."
+                f"expected one of {sorted(_CHECKPOINT_PROFILES)} or 'custom'."
             )
         if self.action_head not in {"actioncodec", "flow"}:
             raise ValueError("action_head must be 'actioncodec' or 'flow'.")
@@ -351,18 +345,9 @@ class G05Config(PreTrainedConfig):
                 raise ValueError("Selected state mapping exceeds policy_state_dim.")
             if max(mapping["action"]) >= self.policy_action_dim:
                 raise ValueError("Selected action mapping exceeds policy_action_dim.")
-        if self.normalization_mode not in {
-            "checkpoint",
-            "q01_q99",
-            "z_score",
-            "z_score_tail_mixed",
-            "identity",
-        }:
-            raise ValueError(
-                "normalization_mode must be checkpoint, q01_q99, z_score, z_score_tail_mixed, or identity."
-            )
         if self.checkpoint_profile == "g05-libero":
-            if self.chunk_size != 32 or self.normalization_mode != "q01_q99":
+            quantiles = NormalizationMode.QUANTILES
+            if self.chunk_size != 32 or self.normalization_mapping.get("ACTION") != quantiles:
                 raise ValueError("g05-libero requires a 32-step chunk and q01/q99 normalization.")
             if self.action_head != "flow":
                 raise ValueError("The released g05-libero config enables only the continuous flow path.")
@@ -391,31 +376,25 @@ class G05Config(PreTrainedConfig):
             raise ValueError("G0.5 image_mean/image_std must be three channels with positive std.")
 
     def validate_features(self) -> None:
-        """Check the state and action features against the configured dimensions."""
-        if self.input_features is None:
-            self.input_features = {}
+        """Derive the input features from the embodiment and check the action width."""
+        # G0.5 reads exactly the raw state and the camera slots. A checkpoint loaded for
+        # another embodiment keeps its saved input features (`make_policy` only fills
+        # empty ones), so they are rebuilt here rather than trusted.
+        self.input_features = {
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(self.raw_state_dim,)),
+            **{
+                key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, *self.camera_sizes[key]))
+                for key in self.camera_order
+            },
+        }
         if self.output_features is None:
             self.output_features = {}
-        state = self.input_features.get(OBS_STATE)
-        if state is not None and state.shape[-1] != self.raw_state_dim:
-            raise ValueError(
-                f"G0.5 {self.embodiment} expects {self.raw_state_dim} raw state dimensions, "
-                f"got {state.shape[-1]}."
-            )
         action = self.output_features.get(ACTION)
         if action is not None and action.shape[-1] != self.raw_action_dim:
             raise ValueError(
                 f"G0.5 {self.embodiment} expects {self.raw_action_dim} raw action dimensions, "
                 f"got {action.shape[-1]}."
             )
-        if OBS_STATE not in self.input_features:
-            self.input_features[OBS_STATE] = PolicyFeature(
-                type=FeatureType.STATE, shape=(self.raw_state_dim,)
-            )
-        for key in self.camera_order:
-            if key not in self.input_features:
-                height, width = self.camera_sizes[key]
-                self.input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, height, width))
         if ACTION not in self.output_features:
             self.output_features[ACTION] = PolicyFeature(
                 type=FeatureType.ACTION, shape=(self.raw_action_dim,)
