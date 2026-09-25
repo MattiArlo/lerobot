@@ -741,39 +741,65 @@ def test_finetune_overrides_reproject_stats_and_retarget_stepwise_unnormalizer(t
     torch.testing.assert_close(norm_step._tensor_stats[OBS_STATE]["q99"][10:16], torch.full((6,), 4.0))
 
 
-def test_recipe_finetune_rebuilds_pipelines_instead_of_loading_them(tmp_path):
-    """A checkpoint exported without recipe training has no render step and no projected
-    stats in its saved pipeline, so turning `use_language_recipe` on for a fine-tune has
-    to rebuild both pipelines from the live config rather than load the serialized ones.
+def test_recipe_finetune_loads_the_saved_pipeline_and_turns_the_renderer_on(tmp_path):
+    """A checkpoint exported without recipe training saves its training renderer with no
+    recipe. Turning `use_language_recipe` on for a fine-tune must switch that renderer on
+    while keeping the serialized pipeline, so overrides and Hub loading behave as usual.
     """
     exported = _config(predict_cot=True, runtime_system="system2")
     preprocessor, postprocessor = make_pre_post_processors(exported)
     preprocessor.save_pretrained(tmp_path)
     postprocessor.save_pretrained(tmp_path)
-    assert (
-        next(step for step in preprocessor.steps if isinstance(step, RenderTrainingMessagesStep)).recipe
-        is None
-    )
+    saved_renderer = next(step for step in preprocessor.steps if isinstance(step, RenderTrainingMessagesStep))
+    assert saved_renderer.recipe is None
 
     finetune = _config(predict_cot=True, runtime_system="system2", use_language_recipe=True)
-    dataset_stats = {
-        OBS_STATE: {"mean": torch.zeros(7), "std": torch.ones(7)},
-        ACTION: {"mean": torch.zeros(7), "std": torch.ones(7)},
-    }
-    rebuilt, _ = make_pre_post_processors(
+    loaded, _ = make_pre_post_processors(
         finetune,
         pretrained_path=tmp_path,
-        dataset_stats=dataset_stats,
         preprocessor_overrides={"rename_observations_processor": {"rename_map": {"a": "b"}}},
     )
 
-    render_step = next(step for step in rebuilt.steps if isinstance(step, RenderTrainingMessagesStep))
+    render_step = next(step for step in loaded.steps if isinstance(step, RenderTrainingMessagesStep))
     assert render_step.recipe is not None
-    # The rebuild loses the serialized rename map, so the caller's override is re-applied.
+    assert [type(step) for step in loaded.steps] == [type(step) for step in preprocessor.steps]
     rename_step = next(
-        step for step in rebuilt.steps if step.__class__.__name__ == "RenameObservationsProcessorStep"
+        step for step in loaded.steps if step.__class__.__name__ == "RenameObservationsProcessorStep"
     )
     assert rename_step.rename_map == {"a": "b"}
+
+    exported_again, _ = make_pre_post_processors(exported, pretrained_path=tmp_path)
+    assert (
+        next(step for step in exported_again.steps if isinstance(step, RenderTrainingMessagesStep)).recipe
+        is None
+    )
+
+
+def test_pipelines_built_from_a_hub_repo_id_download_the_sidecars(tmp_path, monkeypatch):
+    """`lerobot-train` rebuilds G0.5 pipelines from the config with `pretrained_path` set to
+    the `--policy.path` repo id; the tokenizer step must point at a local download."""
+    downloads = []
+
+    def fake_snapshot_download(**kwargs):
+        downloads.append(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr("lerobot.policies.g05.processor_g05.snapshot_download", fake_snapshot_download)
+    config = _config()
+    config.pretrained_path = "lerobot/g05_so101"
+    config.pretrained_revision = "main"
+    preprocessor, _ = make_pre_post_processors(config)
+
+    step = next(step for step in preprocessor.steps if isinstance(step, G05TokenizerStep))
+    assert Path(step.processor_dir) == tmp_path / "hf_processor"
+    assert Path(step.action_tokenizer_path) == tmp_path / "action_tokenizer.safetensors"
+    assert downloads == [
+        {
+            "repo_id": "lerobot/g05_so101",
+            "revision": "main",
+            "allow_patterns": ["hf_processor/**", "action_tokenizer.safetensors"],
+        }
+    ]
 
 
 def test_exact_raw_task_reaches_author_command_and_head_selection():

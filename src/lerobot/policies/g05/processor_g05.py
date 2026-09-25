@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +26,7 @@ from typing import Any
 
 import torch
 import torchvision.transforms.functional as vision_functional
+from huggingface_hub import snapshot_download
 from torch import Tensor
 
 from lerobot.configs.types import FeatureType, NormalizationMode, PipelineFeatureType, PolicyFeature
@@ -94,7 +94,7 @@ def _copy_feature_tree(
 class G05BBoxImageSizeStep(ProcessorStep):
     """Preserve the annotated camera's source size before checkpoint resizing."""
 
-    # Default matches so100/chatton exterior; older Hub JSONs omitted camera_key.
+    # Filled from the live config by `reconcile_g05_processors`.
     camera_key: str = "observation.images.exterior"
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -926,12 +926,19 @@ def reconcile_g05_processors(
     preprocessor: PolicyProcessorPipeline,
     postprocessor: PolicyProcessorPipeline,
 ) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
-    """Fill bbox camera_key on Hub pipelines that saved an empty step config, and
-    hand `G05TokenizerStep` the policy fields it reads, which the live config owns
-    rather than the saved pipeline.
+    """Hand the loaded steps the fields the live config owns rather than the saved pipeline.
+
+    The training recipe is one of them: a checkpoint saved without recipe training
+    stores its training renderer with no recipe, and a fine-tune that turns the
+    recipe on (or off) switches it here instead of rebuilding the pipeline.
     """
     camera_key = config.cot_bbox_camera or (config.camera_order[0] if config.camera_order else None)
-    for step in preprocessor.steps:
+    if config.language_recipe_enabled and config.recipe is None:
+        raise ValueError("G0.5 language training requires a recipe in policy config.")
+    for index, step in enumerate(preprocessor.steps):
+        if isinstance(step, RenderTrainingMessagesStep):
+            recipe = config.recipe if config.language_recipe_enabled else None
+            preprocessor.steps[index] = RenderTrainingMessagesStep(recipe, dataset_ctx=step.dataset_ctx)
         if camera_key is not None and isinstance(step, G05BBoxImageSizeStep):
             step.camera_key = camera_key
         if isinstance(step, G05TokenizerStep):
@@ -954,27 +961,12 @@ def make_g05_pre_post_processors_from_pretrained(
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
-    """Rebuild G0.5 pipelines for recipe fine-tuning and load serialized ones otherwise.
+    """Load the serialized G0.5 pipelines and reconcile them with the live config.
 
-    A checkpoint exported without recipe training has no render step and no
-    projected stats in its saved pipeline, so a fine-tune that turns the recipe on
-    has to rebuild both pipelines from the live config. Every other entry point
-    keeps the serialized pipelines authoritative and only reconciles them.
+    Dataset stats reach the pipelines through the normalizer overrides, which
+    `fix_g05_train_overrides` projects into the checkpoint's policy space.
     """
-    del dataset_meta
-
-    if dataset_stats is not None and config.language_recipe_enabled:
-        logging.info(
-            "Building G0.5 processor pipelines from the active policy config instead of loading them from %s.",
-            pretrained_path,
-        )
-        preprocessor, postprocessor = make_g05_pre_post_processors(config, dataset_stats=dataset_stats)
-        rename_override = (preprocessor_overrides or {}).get("rename_observations_processor")
-        if rename_override:
-            for step in preprocessor.steps:
-                if isinstance(step, RenameObservationsProcessorStep):
-                    step.rename_map = dict(rename_override.get("rename_map") or {})
-        return preprocessor, postprocessor
+    del dataset_stats, dataset_meta
 
     prepared_preprocessor_overrides, prepared_postprocessor_overrides = fix_g05_train_overrides(
         config, preprocessor_overrides, postprocessor_overrides
@@ -988,6 +980,26 @@ def make_g05_pre_post_processors_from_pretrained(
         postprocessor_config_filename=postprocessor_config_filename,
     )
     return reconcile_g05_processors(config, preprocessor, postprocessor)
+
+
+def _sidecar_root(config: G05Config) -> Path:
+    """Return the local checkpoint directory holding the tokenizer sidecars.
+
+    `lerobot-train` rebuilds these pipelines from the config with `pretrained_path`
+    still set to what `--policy.path` named, which may be a Hub repo id.
+    """
+    if config.pretrained_path is None:
+        return Path()
+    root = Path(str(config.pretrained_path))
+    if root.is_dir():
+        return root
+    return Path(
+        snapshot_download(
+            repo_id=str(config.pretrained_path),
+            revision=config.pretrained_revision,
+            allow_patterns=["hf_processor/**", "action_tokenizer.safetensors"],
+        )
+    )
 
 
 def make_g05_pre_post_processors(
@@ -1035,10 +1047,9 @@ def make_g05_pre_post_processors(
         RenderRuntimeMessagesStep(config.recipe),
         RenderTrainingMessagesStep(config.recipe if render_training else None),
         RenameObservationsProcessorStep(rename_map={}),
+        G05BBoxImageSizeStep(camera_key=config.cot_bbox_camera or config.camera_order[0]),
+        AddBatchDimensionProcessorStep(),
     ]
-    if render_training:
-        steps.append(G05BBoxImageSizeStep(camera_key=config.cot_bbox_camera or config.camera_order[0]))
-    steps.append(AddBatchDimensionProcessorStep())
     steps.append(
         G05ImageTransformStep(
             camera_order=config.camera_order,
@@ -1093,7 +1104,7 @@ def make_g05_pre_post_processors(
             )
         )
     steps.append(DeviceProcessorStep(device=config.device))
-    checkpoint_root = Path(str(config.pretrained_path)) if config.pretrained_path is not None else Path()
+    checkpoint_root = _sidecar_root(config)
     steps.append(
         G05TokenizerStep(
             processor_dir=str(checkpoint_root / "hf_processor"),
