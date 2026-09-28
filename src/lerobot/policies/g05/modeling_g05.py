@@ -2051,8 +2051,7 @@ class G05Policy(PreTrainedPolicy):
         if isinstance(image_size, Tensor):
             image_size = image_size.detach().cpu().tolist()
         if not isinstance(image_size, list | tuple) or len(image_size) != 2:
-            camera = self.config.cot_bbox_camera or self.config.camera_order[0]
-            image_size = self.config.camera_sizes[camera]
+            image_size = self.config.camera_sizes[self.config.bbox_camera]
         bbox = self._format_bbox_target(bbox_json, (int(image_size[0]), int(image_size[1])))
 
         fields = tuple(field for field, value in (("bbox", bbox), ("subtask", subtask)) if value)

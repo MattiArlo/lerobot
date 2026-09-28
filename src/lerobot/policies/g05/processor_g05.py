@@ -387,17 +387,25 @@ class G05EmbodimentProjectionStep(ProcessorStep):
     policy_state_dim: int
     policy_action_dim: int
     camera_order: tuple[str, ...]
+    # Empty on pipelines saved before slots were serialized: the embodiment's table then applies.
+    state_slots: tuple[int, ...] = ()
+    action_slots: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        """Freeze the camera order and check the embodiment is known."""
+        """Freeze the camera order and resolve the slots."""
         self.camera_order = tuple(self.camera_order)
-        if self.embodiment not in G05_EMBODIMENT_MAPPINGS:
-            raise ValueError(f"No projection is defined for G0.5 embodiment {self.embodiment!r}.")
+        if not self.state_slots:
+            if self.embodiment not in G05_EMBODIMENT_MAPPINGS:
+                raise ValueError(f"No projection is defined for G0.5 embodiment {self.embodiment!r}.")
+            self.state_slots = G05_EMBODIMENT_MAPPINGS[self.embodiment]["state"]
+            self.action_slots = G05_EMBODIMENT_MAPPINGS[self.embodiment]["action"]
+        self.state_slots = tuple(self.state_slots)
+        self.action_slots = tuple(self.action_slots)
 
     @property
     def mapping(self) -> dict[str, tuple[int, ...]]:
-        """Policy-slot indices this embodiment writes its state and action into."""
-        return G05_EMBODIMENT_MAPPINGS[self.embodiment]
+        """Policy-slot indices the raw state and action are written into."""
+        return {"state": self.state_slots, "action": self.action_slots}
 
     @staticmethod
     def _project(value: torch.Tensor, indices: tuple[int, ...], width: int) -> torch.Tensor:
@@ -494,6 +502,8 @@ class G05EmbodimentProjectionStep(ProcessorStep):
             "policy_state_dim": self.policy_state_dim,
             "policy_action_dim": self.policy_action_dim,
             "camera_order": list(self.camera_order),
+            "state_slots": list(self.state_slots),
+            "action_slots": list(self.action_slots),
         }
 
 
@@ -626,11 +636,17 @@ class G05InverseActionProjectionStep(PolicyActionProcessorStep):
 
     embodiment: str
     policy_action_dim: int
+    # Empty on pipelines saved before slots were serialized: the embodiment's table then applies.
+    action_slots: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Resolve the action slots."""
+        self.action_slots = tuple(self.action_slots or G05_EMBODIMENT_MAPPINGS[self.embodiment]["action"])
 
     @property
     def indices(self) -> tuple[int, ...]:
-        """Policy-slot indices holding this embodiment's action dimensions."""
-        return G05_EMBODIMENT_MAPPINGS[self.embodiment]["action"]
+        """Policy-slot indices holding the raw action dimensions."""
+        return self.action_slots
 
     def action(self, action: PolicyAction) -> PolicyAction:
         """Gather the embodiment's action dimensions back out of the policy layout."""
@@ -651,7 +667,11 @@ class G05InverseActionProjectionStep(PolicyActionProcessorStep):
 
     def get_config(self) -> dict[str, Any]:
         """Return this step's serializable configuration."""
-        return {"embodiment": self.embodiment, "policy_action_dim": self.policy_action_dim}
+        return {
+            "embodiment": self.embodiment,
+            "policy_action_dim": self.policy_action_dim,
+            "action_slots": list(self.action_slots),
+        }
 
 
 @dataclass
@@ -739,6 +759,17 @@ def _tokenizer_policy_config(config: G05Config) -> dict[str, Any]:
     }
 
 
+def _slot_mapping(config: G05Config) -> dict[str, tuple[int, ...]]:
+    """The config's state/action slots, which a policy without a named embodiment gets from its dataset."""
+    mapping = config.slot_mapping
+    if mapping is None:
+        raise ValueError(
+            f"G0.5 embodiment {config.embodiment!r} has no named slot table; set state_slots and "
+            "action_slots, or build the policy from a dataset whose features carry joint names."
+        )
+    return mapping
+
+
 def _project_stats(
     config: G05Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None,
@@ -747,7 +778,7 @@ def _project_stats(
     if not dataset_stats:
         return dataset_stats
     result: dict[str, dict[str, torch.Tensor]] = {}
-    mapping = G05_EMBODIMENT_MAPPINGS[config.embodiment]
+    mapping = _slot_mapping(config)
     widths = {OBS_STATE: config.policy_state_dim, ACTION: config.policy_action_dim}
     index_maps = {OBS_STATE: mapping["state"], ACTION: mapping["action"]}
     for feature_name, stats in dataset_stats.items():
@@ -828,7 +859,7 @@ def reconcile_g05_processors(
     stores its training renderer with no recipe, and a fine-tune that turns the
     recipe on (or off) switches it here instead of rebuilding the pipeline.
     """
-    camera_key = config.cot_bbox_camera or (config.camera_order[0] if config.camera_order else None)
+    camera_key = config.bbox_camera
     if config.language_recipe_enabled and config.recipe is None:
         raise ValueError("G0.5 language training requires a recipe in policy config.")
     for index, step in enumerate(preprocessor.steps):
@@ -934,7 +965,7 @@ def make_g05_pre_post_processors(
         RenderRuntimeMessagesStep(config.recipe),
         RenderTrainingMessagesStep(config.recipe if render_training else None),
         RenameObservationsProcessorStep(rename_map={}),
-        G05BBoxImageSizeStep(camera_key=config.cot_bbox_camera or config.camera_order[0]),
+        G05BBoxImageSizeStep(camera_key=config.bbox_camera),
         AddBatchDimensionProcessorStep(),
     ]
     steps.append(
@@ -975,6 +1006,8 @@ def make_g05_pre_post_processors(
                 policy_state_dim=config.policy_state_dim,
                 policy_action_dim=config.policy_action_dim,
                 camera_order=config.camera_order,
+                state_slots=_slot_mapping(config)["state"],
+                action_slots=_slot_mapping(config)["action"],
             ),
         ]
     )
@@ -1024,7 +1057,9 @@ def make_g05_pre_post_processors(
     ]
     output_steps.append(
         G05InverseActionProjectionStep(
-            embodiment=config.embodiment, policy_action_dim=config.policy_action_dim
+            embodiment=config.embodiment,
+            policy_action_dim=config.policy_action_dim,
+            action_slots=_slot_mapping(config)["action"],
         )
     )
     if config.libero_gripper_binarize:

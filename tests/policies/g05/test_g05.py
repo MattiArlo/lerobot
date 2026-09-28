@@ -39,7 +39,12 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
-from lerobot.policies.g05.configuration_g05 import G05_CAMERA_PROFILES, G05_EMBODIMENT_MAPPINGS, G05Config
+from lerobot.policies.g05.configuration_g05 import (
+    G05_CAMERA_PROFILES,
+    G05_EMBODIMENT_MAPPINGS,
+    G05Config,
+    derive_g05_slots,
+)
 from lerobot.policies.g05.modeling_g05 import (
     G05_RUNTIME_PREDICT_COT,
     G05GatedDeltaNet,
@@ -49,6 +54,8 @@ from lerobot.policies.g05.modeling_g05 import (
 )
 from lerobot.policies.g05.processor_g05 import (
     G05ActionOperationMaskStep,
+    G05EmbodimentProjectionStep,
+    G05InverseActionProjectionStep,
     G05RelativeJointActionsStep,
     G05TokenizerStep,
 )
@@ -1225,7 +1232,7 @@ def test_recipe_preprocessor_resolves_lerobot_subtask_and_bbox_annotations():
                     '{"detections": [{"label": "cup", "bbox_format": "xyxy", "bbox": [20, 10, 100, 50]}]}'
                 ),
                 "style": "vqa",
-                "camera": "observation.images.exterior",
+                "camera": "observation.images.image",
                 "tool_calls": None,
             }
         ],
@@ -1644,6 +1651,91 @@ def test_input_features_follow_the_embodiment_not_the_saved_checkpoint():
 
     assert config.input_features[OBS_STATE].shape == (6,)
     assert list(config.input_features) == [OBS_STATE, *G05_CAMERA_PROFILES["so100"]]
+
+
+_OMX_JOINTS = [
+    "shoulder_pan.pos",
+    "shoulder_lift.pos",
+    "elbow_flex.pos",
+    "wrist_flex.pos",
+    "wrist_roll.pos",
+    "gripper.pos",
+]
+
+
+@pytest.mark.parametrize(
+    ("names", "slots"),
+    [
+        (_OMX_JOINTS, (10, 11, 12, 13, 14, 19)),
+        ([f"joint{index}.pos" for index in range(1, 8)] + ["gripper.pos"], (10, 11, 12, 13, 14, 15, 16, 19)),
+        (["left_waist", "left_elbow", "left_gripper", "right_waist", "right_gripper"], (0, 1, 9, 10, 19)),
+    ],
+)
+def test_slots_are_derived_from_joint_names(names, slots):
+    assert derive_g05_slots(names, 27) == slots
+
+
+def test_slot_derivation_rejects_joints_that_do_not_fit():
+    with pytest.raises(ValueError, match="right_control part holds 9"):
+        derive_g05_slots([f"joint{index}" for index in range(10)], 27)
+
+
+def _new_robot_config(**kwargs) -> G05Config:
+    """A `g05_base`-shaped config fine-tuned on a robot without a named embodiment."""
+    return G05Config(
+        checkpoint_profile="custom",
+        embodiment="omx",
+        policy_state_dim=27,
+        policy_action_dim=27,
+        camera_order=("observation.images.top", None, "observation.images.wrist"),
+        camera_sizes={"observation.images.head_rgb": (256, 256)} | kwargs.pop("camera_sizes", {}),
+        normalization_mapping=_MEAN_STD,
+        device="cpu",
+        **kwargs,
+    )
+
+
+def test_new_robot_takes_its_layout_from_the_dataset(tmp_path: Path):
+    config = _new_robot_config()
+    joints = {"dtype": "float32", "shape": (6,), "names": _OMX_JOINTS}
+    config.set_dataset_feature_metadata({OBS_STATE: joints, ACTION: joints})
+    config.validate_features()
+
+    assert config.state_slots == config.action_slots == (10, 11, 12, 13, 14, 19)
+    assert (config.raw_state_dim, config.raw_action_dim) == (6, 6)
+    assert config.camera_order[1] in config.optional_camera_keys
+    assert set(config.camera_sizes) == set(config.camera_order)
+    assert "camera=observation.images.top)" in config.recipe["bindings"]["bbox"]
+
+    preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=_raw_stats(6))
+    projection = next(step for step in preprocessor.steps if isinstance(step, G05EmbodimentProjectionStep))
+    inverse = next(step for step in postprocessor.steps if isinstance(step, G05InverseActionProjectionStep))
+    assert projection.mapping["state"] == inverse.indices == (10, 11, 12, 13, 14, 19)
+
+    config._save_pretrained(tmp_path)
+    reloaded = G05Config.from_pretrained(tmp_path)
+    assert (reloaded.state_slots, reloaded.camera_order) == (config.state_slots, config.camera_order)
+
+
+def test_new_robot_without_joint_names_asks_for_slots():
+    config = _new_robot_config()
+    with pytest.raises(ValueError, match="no joint names"):
+        config.set_dataset_feature_metadata({OBS_STATE: {"shape": (6,)}, ACTION: {"shape": (6,)}})
+    with pytest.raises(ValueError, match="set state_slots and action_slots"):
+        config.validate_features()
+
+
+def test_pipelines_saved_without_slots_use_the_embodiment_table():
+    step = G05EmbodimentProjectionStep(
+        embodiment="so100",
+        policy_state_dim=20,
+        policy_action_dim=20,
+        camera_order=G05_CAMERA_PROFILES["so100"],
+    )
+    inverse = G05InverseActionProjectionStep(embodiment="so100", policy_action_dim=20)
+
+    assert step.mapping == G05_EMBODIMENT_MAPPINGS["so100"]
+    assert inverse.indices == G05_EMBODIMENT_MAPPINGS["so100"]["action"]
 
 
 def test_r1lite_action_filter_is_skipped_for_other_embodiments():

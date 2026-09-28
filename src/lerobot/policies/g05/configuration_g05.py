@@ -16,6 +16,8 @@
 
 """Configuration for the OpenGalaxea G0.5 policy adapter."""
 
+import re
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -26,14 +28,23 @@ from lerobot.optim.schedulers import ConstantWithWarmupSchedulerConfig, LRSchedu
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
-def _g05_default_recipe() -> dict:
+def _bbox_binding(camera: str) -> str:
+    """Bind the BBox target to the VQA answers annotated on ``camera``."""
+    return f"emitted_at(t, style=vqa, role=assistant, camera={camera})"
+
+
+# Matches the built-in BBox binding whatever camera it was saved with.
+_DEFAULT_BBOX_BINDING = re.compile(r"emitted_at\(t, style=vqa, role=assistant, camera=[^,)]*\)")
+
+
+def _g05_default_recipe(bbox_camera: str = "observation.images.exterior") -> dict:
     """G0.5's native BBox/Subtask chain-of-thought supervision.
 
     Serialized like EO-1's default recipe so policy config discovery stays
     independent of the dataset extras that `lerobot.datasets.recipe` needs.
     """
     return {
-        "bindings": {"bbox": "emitted_at(t, style=vqa, role=assistant, camera=observation.images.exterior)"},
+        "bindings": {"bbox": _bbox_binding(bbox_camera)},
         "messages": [
             {"role": "user", "content": "${task}", "stream": "low_level"},
             {
@@ -188,6 +199,51 @@ G05_POLICY_PARTS: dict[int, dict[str, int]] = {
     },
 }
 
+_SIDE_PREFIX = re.compile(r"^(left|right)[_.\-]")
+
+
+def _part_offsets(width: int) -> dict[str, int]:
+    """Start index of each part in the ``width``-dim policy layout."""
+    offsets, start = {}, 0
+    for part, size in G05_POLICY_PARTS[width].items():
+        offsets[part] = start
+        start += size
+    return offsets
+
+
+def derive_g05_slots(names: Sequence[str], width: int) -> tuple[int, ...]:
+    """Place a robot's joints in the shared policy layout from their names.
+
+    A ``left_``-prefixed joint goes on the left arm and any other joint on the right arm, so a
+    single-arm robot fills the right arm like the released single-arm checkpoints. A joint whose
+    name contains ``gripper`` takes that arm's gripper slot; the others fill its control slots in
+    order.
+    """
+    parts, offsets = G05_POLICY_PARTS[width], _part_offsets(width)
+    used = {"left_control": 0, "right_control": 0, "left_gripper": 0, "right_gripper": 0}
+    slots = []
+    for name in names:
+        match = _SIDE_PREFIX.match(name.lower())
+        side = match.group(1) if match else "right"
+        part = f"{side}_gripper" if "gripper" in name.lower() else f"{side}_control"
+        if used[part] >= parts[part]:
+            raise ValueError(
+                f"Joint {name!r} does not fit: the G0.5 {part} part holds {parts[part]} value(s). "
+                "Set state_slots/action_slots explicitly."
+            )
+        slots.append(offsets[part] + used[part])
+        used[part] += 1
+    return tuple(slots)
+
+
+def _feature_names(feature: Any) -> list[str] | None:
+    """Flat per-dimension names of a dataset feature, or None when it has none."""
+    names = feature.get("names") if isinstance(feature, dict) else None
+    if isinstance(names, dict):
+        names = [name for group in names.values() for name in group]
+    return list(names) if names else None
+
+
 _CHECKPOINT_PROFILES = ("g05-base", "g05-libero", "g05-robotwin20", "g05-so101")
 
 
@@ -218,6 +274,10 @@ class G05Config(PreTrainedConfig):
     policy_state_dim: int = 20
     raw_action_dim: int = 7
     raw_state_dim: int = 7
+    # Policy-layout slot of each raw state/action value. Empty means the named embodiment's
+    # table, or, for another robot, slots derived from the dataset's joint names.
+    state_slots: tuple[int, ...] = ()
+    action_slots: tuple[int, ...] = ()
     chunk_size: int = 16
     n_action_steps: int = 16
     normalization_clip: tuple[float, float] | None = None
@@ -228,7 +288,8 @@ class G05Config(PreTrainedConfig):
     joint_signs: tuple[float, ...] = ()
     joint_offsets: tuple[float, ...] = ()
     libero_gripper_binarize: bool = False
-    camera_order: tuple[str, ...] = field(default_factory=lambda: G05_CAMERA_PROFILES["libero"])
+    # Dataset camera feeding each checkpoint image slot, in slot order; `None` leaves a slot empty.
+    camera_order: tuple[str | None, ...] = field(default_factory=lambda: G05_CAMERA_PROFILES["libero"])
     camera_sizes: dict[str, tuple[int, int]] = field(default_factory=dict)
     optional_camera_keys: tuple[str, ...] = ()
     image_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
@@ -269,9 +330,17 @@ class G05Config(PreTrainedConfig):
 
             resolved = resolve_recipe_override(self.recipe, self.recipe_path)
             self.recipe = asdict(resolved) if resolved is not None else None
-        self.camera_order = tuple(self.camera_order)
+        # An empty slot becomes an optional camera, which the image step zero-fills.
+        empty = {
+            index: f"observation.images.empty_{index}"
+            for index, key in enumerate(self.camera_order)
+            if key is None
+        }
+        self.camera_order = tuple(empty.get(index, key) for index, key in enumerate(self.camera_order))
         self.camera_sizes = {key: tuple(size) for key, size in (self.camera_sizes or {}).items()}
-        self.optional_camera_keys = tuple(self.optional_camera_keys)
+        self.optional_camera_keys = tuple(dict.fromkeys((*self.optional_camera_keys, *empty.values())))
+        self.state_slots = tuple(int(slot) for slot in self.state_slots)
+        self.action_slots = tuple(int(slot) for slot in self.action_slots)
         if self.normalization_clip is not None:
             self.normalization_clip = tuple(self.normalization_clip)
             if len(self.normalization_clip) != 2 or self.normalization_clip[0] >= self.normalization_clip[1]:
@@ -286,11 +355,22 @@ class G05Config(PreTrainedConfig):
             raise ValueError("joint_signs must cover exactly the raw state dimensions.")
         if self.joint_signs and len(self.joint_signs) != self.raw_action_dim:
             raise ValueError("joint_signs must cover exactly the raw action dimensions.")
-        if self.embodiment in G05_CAMERA_SIZE_PROFILES and set(self.camera_sizes) != set(self.camera_order):
-            # Switching embodiment on a packaged checkpoint keeps the previous
-            # embodiment's camera entries (config-file/CLI dict values merge
-            # instead of replacing); rebuild sizes from the named profile.
-            self.camera_sizes = G05_CAMERA_SIZE_PROFILES[self.embodiment].copy()
+        if set(self.camera_sizes) != set(self.camera_order):
+            # New cameras on a packaged checkpoint keep its per-slot sizes (config-file/CLI
+            # dict values merge instead of replacing, so the saved entries are still there).
+            profile = G05_CAMERA_SIZE_PROFILES.get(self.embodiment, {})
+            slot_sizes = list(self.camera_sizes.values()) or list(profile.values())
+            self.camera_sizes = {
+                key: self.camera_sizes.get(key)
+                or profile.get(key)
+                or (slot_sizes[index] if index < len(slot_sizes) else (256, 256))
+                for index, key in enumerate(self.camera_order)
+            }
+        if self.recipe is not None and self.recipe_path is None:
+            bindings = self.recipe.get("bindings") or {}
+            if _DEFAULT_BBOX_BINDING.fullmatch(bindings.get("bbox", "")):
+                # The built-in recipe reads the boxes annotated on the bbox camera.
+                self.recipe["bindings"] = {**bindings, "bbox": _bbox_binding(self.bbox_camera)}
         if self.num_input_images == 0:
             self.num_input_images = len(self.camera_order) * self.n_obs_steps
         if self.num_prompt_images == 0:
@@ -333,18 +413,10 @@ class G05Config(PreTrainedConfig):
             )
         if not (self.discrete_action or self.continuous_action):
             raise ValueError("At least one G0.5 action path must be enabled.")
-        if self.embodiment not in G05_EMBODIMENT_MAPPINGS:
-            raise ValueError(f"No named G0.5 embodiment mapping for {self.embodiment!r}.")
-        mapping = G05_EMBODIMENT_MAPPINGS.get(self.embodiment)
-        if mapping is not None:
-            if len(mapping["state"]) != self.raw_state_dim:
-                raise ValueError("raw_state_dim does not match the selected embodiment mapping.")
-            if len(mapping["action"]) != self.raw_action_dim:
-                raise ValueError("raw_action_dim does not match the selected embodiment mapping.")
-            if max(mapping["state"]) >= self.policy_state_dim:
-                raise ValueError("Selected state mapping exceeds policy_state_dim.")
-            if max(mapping["action"]) >= self.policy_action_dim:
-                raise ValueError("Selected action mapping exceeds policy_action_dim.")
+        if bool(self.state_slots) != bool(self.action_slots):
+            raise ValueError("state_slots and action_slots must be set together.")
+        if self.slot_mapping is not None:
+            self._apply_slots()
         if self.checkpoint_profile == "g05-libero":
             quantiles = NormalizationMode.QUANTILES
             if self.chunk_size != 32 or self.normalization_mapping.get("ACTION") != quantiles:
@@ -353,11 +425,6 @@ class G05Config(PreTrainedConfig):
                 raise ValueError("The released g05-libero config enables only the continuous flow path.")
             if not self.libero_gripper_binarize:
                 raise ValueError("g05-libero requires the official binary gripper command transform.")
-        expected_cameras = G05_CAMERA_PROFILES.get(self.embodiment)
-        if expected_cameras is not None and tuple(self.camera_order) != expected_cameras:
-            raise ValueError(
-                f"{self.embodiment} camera_order must be {expected_cameras}, got {self.camera_order}."
-            )
         if set(self.camera_sizes) != set(self.camera_order):
             raise ValueError("camera_sizes must contain exactly the ordered checkpoint camera keys.")
         if not set(self.optional_camera_keys) <= set(self.camera_order):
@@ -375,8 +442,58 @@ class G05Config(PreTrainedConfig):
         if len(self.image_mean) != 3 or len(self.image_std) != 3 or min(self.image_std) <= 0:
             raise ValueError("G0.5 image_mean/image_std must be three channels with positive std.")
 
+    @property
+    def slot_mapping(self) -> dict[str, tuple[int, ...]] | None:
+        """Policy-layout slots of the raw state and action, or None until a dataset provides them."""
+        if self.state_slots:
+            return {"state": self.state_slots, "action": self.action_slots}
+        return G05_EMBODIMENT_MAPPINGS.get(self.embodiment)
+
+    @property
+    def bbox_camera(self) -> str:
+        """Camera whose image the BBox targets are expressed in."""
+        filled = [key for key in self.camera_order if key not in self.optional_camera_keys]
+        return self.cot_bbox_camera or (filled or self.camera_order)[0]
+
+    def _apply_slots(self) -> None:
+        """Size the raw state/action from the slots and check they fit the policy layout."""
+        mapping = self.slot_mapping
+        if self.state_slots:
+            self.raw_state_dim, self.raw_action_dim = len(self.state_slots), len(self.action_slots)
+        for key, width in (("state", self.policy_state_dim), ("action", self.policy_action_dim)):
+            raw_dim = self.raw_state_dim if key == "state" else self.raw_action_dim
+            if len(mapping[key]) != raw_dim:
+                raise ValueError(f"raw_{key}_dim does not match the selected embodiment mapping.")
+            if (
+                len(set(mapping[key])) != len(mapping[key])
+                or not 0 <= min(mapping[key]) <= max(mapping[key]) < width
+            ):
+                raise ValueError(f"G0.5 {key} slots must be distinct indices below policy_{key}_dim={width}.")
+        if self.joint_signs and len(self.joint_signs) != self.raw_state_dim:
+            raise ValueError("joint_signs must cover exactly the raw state dimensions.")
+
+    def set_dataset_feature_metadata(self, features: dict[str, Any]) -> None:
+        """Derive the slots of a robot without a named embodiment from the dataset's joint names."""
+        if self.slot_mapping is not None:
+            return
+        names = {key: _feature_names(features.get(key)) for key in (OBS_STATE, ACTION)}
+        missing = [key for key, value in names.items() if value is None]
+        if missing:
+            raise ValueError(
+                f"G0.5 embodiment {self.embodiment!r} has no named slot table and the dataset gives "
+                f"no joint names for {missing}; set state_slots and action_slots."
+            )
+        self.state_slots = derive_g05_slots(names[OBS_STATE], self.policy_state_dim)
+        self.action_slots = derive_g05_slots(names[ACTION], self.policy_action_dim)
+        self._apply_slots()
+
     def validate_features(self) -> None:
         """Derive the input features from the embodiment and check the action width."""
+        if self.slot_mapping is None:
+            raise ValueError(
+                f"G0.5 embodiment {self.embodiment!r} has no named slot table; set state_slots and "
+                "action_slots, or train on a dataset whose state/action features carry joint names."
+            )
         # G0.5 reads exactly the raw state and the camera slots. A checkpoint loaded for
         # another embodiment keeps its saved input features (`make_policy` only fills
         # empty ones), so they are rebuilt here rather than trusted.
